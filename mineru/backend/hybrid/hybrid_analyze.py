@@ -1,6 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import asyncio
 import os
+import re
 import time
 from collections import defaultdict
 
@@ -61,6 +62,23 @@ HYBRID_OCR_DET_TEXT_TYPES = set(not_extract_list)
 BENCH_REMOTE_EXTRACT_TYPES = frozenset(
     {BlockType.TABLE, BlockType.EQUATION, BlockType.IMAGE, BlockType.CHART}
 )
+BENCH_REMOTE_TEXT_TYPES = frozenset(
+    {
+        BlockType.TEXT,
+        "ocr_text",
+        MineruBlockType.DOC_TITLE,
+        MineruBlockType.PARAGRAPH_TITLE,
+        BlockType.TITLE,
+        BlockType.LIST,
+        BlockType.REF_TEXT,
+        BlockType.PHONETIC,
+        BlockType.LIST_ITEM,
+    }
+)
+_BENCH_SUSPICIOUS_TEXT_RE = re.compile(
+    r"(\\mathsf|\\mathrm|\\mathfrak|\\left|\\right|\^\s*\{|\$\s*\^)",
+    re.IGNORECASE,
+)
 
 
 def _bench_dual_predictor_enabled(backend: str, server_url: str | None) -> bool:
@@ -94,6 +112,141 @@ def _apply_remote_extract_outputs(
     for (img_idx, idx), output in zip(all_indices, outputs):
         layout_results[img_idx][idx].content = output.text
         layout_results[img_idx][idx].scored = output.scored
+
+
+def _bench_remote_text_repair_enabled() -> bool:
+    raw = os.getenv("MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR", "").strip().lower()
+    if raw == "":
+        return True
+    return raw in {"1", "true", "yes"}
+
+
+def _bench_remote_text_repair_max_blocks() -> int:
+    raw = os.getenv("MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR_MAX_BLOCKS", "").strip()
+    if not raw:
+        return 8
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR_MAX_BLOCKS={!r}, using default 8",
+            raw,
+        )
+        return 8
+    return max(1, value)
+
+
+def _crop_normalized_bbox_from_page_image(page_image, bbox):
+    if not (isinstance(bbox, list) and len(bbox) == 4):
+        return None
+    try:
+        x0, y0, x1, y1 = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    width, height = page_image.size
+    left = max(0, min(width, int(x0 * width)))
+    top = max(0, min(height, int(y0 * height)))
+    right = max(0, min(width, int(x1 * width)))
+    bottom = max(0, min(height, int(y1 * height)))
+    if right <= left or bottom <= top:
+        return None
+    return page_image.crop((left, top, right, bottom))
+
+
+def _build_suspicious_text_repair_candidates(
+    images,
+    page_model_list,
+    max_blocks: int,
+) -> list[tuple[dict, object, str]]:
+    candidates: list[tuple[dict, object, str]] = []
+    for page_image, page_blocks in zip(images, page_model_list):
+        for block in page_blocks:
+            block_type = block.get("type")
+            if block_type not in BENCH_REMOTE_TEXT_TYPES:
+                continue
+            text_field = "text" if block_type == "ocr_text" else "content"
+            content = block.get(text_field)
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if not _BENCH_SUSPICIOUS_TEXT_RE.search(content):
+                continue
+            crop = _crop_normalized_bbox_from_page_image(page_image, block.get("bbox"))
+            if crop is None:
+                continue
+            candidates.append((block, crop, text_field))
+            if len(candidates) >= max_blocks:
+                return candidates
+    return candidates
+
+
+def _repair_suspicious_text_blocks_with_remote(
+    extract_predictor: MinerUClient,
+    images,
+    page_model_list,
+) -> None:
+    if not _bench_remote_text_repair_enabled():
+        return
+    candidates = _build_suspicious_text_repair_candidates(
+        images,
+        page_model_list,
+        _bench_remote_text_repair_max_blocks(),
+    )
+    if not candidates:
+        return
+    outputs = extract_predictor.batch_content_extract(
+        [crop for _, crop, _ in candidates],
+        ["text"] * len(candidates),
+    )
+    replaced = 0
+    for (block, _, text_field), output in zip(candidates, outputs):
+        if output is None:
+            continue
+        text = str(output).strip()
+        if not text:
+            continue
+        block[text_field] = text
+        replaced += 1
+    logger.info(
+        "Bench dual-predictor remote text repairs: candidates={} replaced={}",
+        len(candidates),
+        replaced,
+    )
+
+
+async def _aio_repair_suspicious_text_blocks_with_remote(
+    extract_predictor: MinerUClient,
+    images,
+    page_model_list,
+    semaphore: asyncio.Semaphore | None = None,
+) -> None:
+    if not _bench_remote_text_repair_enabled():
+        return
+    candidates = _build_suspicious_text_repair_candidates(
+        images,
+        page_model_list,
+        _bench_remote_text_repair_max_blocks(),
+    )
+    if not candidates:
+        return
+    outputs = await extract_predictor.aio_batch_content_extract(
+        [crop for _, crop, _ in candidates],
+        ["text"] * len(candidates),
+        semaphore=semaphore,
+    )
+    replaced = 0
+    for (block, _, text_field), output in zip(candidates, outputs):
+        if output is None:
+            continue
+        text = str(output).strip()
+        if not text:
+            continue
+        block[text_field] = text
+        replaced += 1
+    logger.info(
+        "Bench dual-predictor remote text repairs: candidates={} replaced={}",
+        len(candidates),
+        replaced,
+    )
 
 
 def _summarize_remote_prompt_mix(prompts: list[str]) -> dict[str, int]:
@@ -1030,6 +1183,12 @@ def doc_analyze(
                             _ocr_enable,
                             batch_ratio=batch_ratio,
                         )
+                        if extract_predictor is not None:
+                            _repair_suspicious_text_blocks_with_remote(
+                                extract_predictor,
+                                images_pil_list,
+                                window_model_list,
+                            )
 
                     model_list.extend(window_model_list)
                     if progress_bar is None:
@@ -1202,6 +1361,13 @@ async def aio_doc_analyze(
                             _ocr_enable,
                             batch_ratio=batch_ratio,
                         )
+                        if extract_predictor is not None:
+                            await _aio_repair_suspicious_text_blocks_with_remote(
+                                extract_predictor,
+                                images_pil_list,
+                                window_model_list,
+                                semaphore=None,
+                            )
 
                     model_list.extend(window_model_list)
                     if progress_bar is None:
