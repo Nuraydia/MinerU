@@ -36,8 +36,71 @@ from ...utils.pdfium_guard import (
 )
 from ...utils.models_download_utils import auto_download_and_get_model_root_path
 
-from mineru_vl_utils import MinerUClient
+from mineru_vl_utils import MinerUClient, MinerUSamplingParams
+from mineru_vl_utils.vlm_client.base_client import DEFAULT_SYSTEM_PROMPT
 from packaging import version
+
+
+_QWEN_MINERU_COMPAT_SYSTEM_PROMPT = (
+    "You are MinerU's vision extraction engine. "
+    "Always follow the task suffix exactly and return only the requested payload. "
+    "Do not output explanations, commentary, markdown fences, or JSON unless explicitly required by the task. "
+    "Layout Detection output contract: return only MinerU layout tokens "
+    "(<|box_start|>...<|box_end|><|ref_start|>type<|ref_end|>...), never JSON arrays. "
+    "Table Recognition output contract: return exactly one complete HTML table fragment "
+    "(<table>...</table>) with rows and cells preserved; no prose; no markdown table pipes; no code fences. "
+    "If table cell content contains formulas, keep formulas inside <eq>...</eq> tags. "
+    "Formula Recognition output contract: return only the formula content in clean LaTeX-compatible form; "
+    "no natural-language explanation and no surrounding ``` fences. "
+    "Image Analysis output contract: return only MinerU-tagged fields "
+    "(<|class_start|>...<|class_end|>, <|sub_class_start|>...<|sub_class_end|>, "
+    "<|caption_start|>...<|caption_end|>, <|content_start|>...<|content_end|>). "
+    "Isotope formatting rules: prefer canonical Unicode in plain text (¹⁷⁷Lu, ⁶⁸Ga-PSMA-11, ⁹⁹ᵐTc-MDP, ⁶⁸Ge/⁶⁸Ga); "
+    "when LaTeX is required, use compact form without spaced tokens "
+    "(^{177}\\mathrm{Lu}, ^{68}\\mathrm{Ga}, ^{99m}\\mathrm{Tc}) and avoid malformed spacing like "
+    "^ { 1 7 7 } \\mathsf { L u }."
+)
+
+
+def _resolve_vl_system_prompt() -> str:
+    raw = os.getenv("MINERU_VL_SYSTEM_PROMPT", "").strip()
+    if raw:
+        return raw
+    profile = os.getenv("MINERU_VL_PROMPT_PROFILE", "").strip().lower()
+    if profile in {"qwen-mineru-compat", "mineru-qwen-compat"}:
+        return _QWEN_MINERU_COMPAT_SYSTEM_PROMPT
+    return DEFAULT_SYSTEM_PROMPT
+
+
+def _apply_vl_max_new_tokens_from_env(predictor: MinerUClient, backend: str) -> None:
+    if not backend.endswith("-http-client"):
+        return
+    raw = os.getenv("MINERU_VL_MAX_NEW_TOKENS", "").strip()
+    if not raw:
+        return
+    try:
+        limit = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid MINERU_VL_MAX_NEW_TOKENS={!r}", raw)
+        return
+    if limit <= 0:
+        return
+    for name, params in list(predictor.sampling_params.items()):
+        predictor.sampling_params[name] = MinerUSamplingParams(
+            temperature=params.temperature,
+            top_p=params.top_p,
+            top_k=params.top_k,
+            presence_penalty=params.presence_penalty,
+            frequency_penalty=params.frequency_penalty,
+            repetition_penalty=params.repetition_penalty,
+            no_repeat_ngram_size=params.no_repeat_ngram_size,
+            max_new_tokens=limit,
+        )
+    logger.info(
+        "http-client VLM max_new_tokens={} (MINERU_VL_MAX_NEW_TOKENS) for backend={}",
+        limit,
+        backend,
+    )
 
 
 class ModelSingleton:
@@ -56,9 +119,10 @@ class ModelSingleton:
         backend: str,
         model_path: str | None,
         server_url: str | None,
+        vl_system_prompt: str | None = None,
         **kwargs,
     ) -> MinerUClient:
-        key = (backend, model_path, server_url)
+        key = (backend, model_path, server_url, vl_system_prompt)
         with self._lock:
             if key not in self._models:
                 start_time = time.time()
@@ -233,6 +297,7 @@ class ModelSingleton:
                     server_headers=server_headers,
                     max_retries=max_retries,
                     retry_backoff_factor=retry_backoff_factor,
+                    system_prompt=vl_system_prompt or _resolve_vl_system_prompt(),
                     enable_table_formula_eq_wrap=True,
                     image_analysis=True,
                     enable_cross_page_table_merge=True,
@@ -246,6 +311,7 @@ class ModelSingleton:
                     "lmdeploy_engine": lmdeploy_engine,
                 }
                 _maybe_enable_serial_execution(predictor, backend)
+                _apply_vl_max_new_tokens_from_env(predictor, backend)
                 self._models[key] = predictor
                 elapsed = round(time.time() - start_time, 2)
                 logger.info(f"get {backend} predictor cost: {elapsed}s")
@@ -266,6 +332,7 @@ async def _get_model_async(
     backend: str,
     model_path: str | None,
     server_url: str | None,
+    vl_system_prompt: str | None = None,
     **kwargs,
 ) -> MinerUClient:
     return await asyncio.to_thread(
@@ -273,6 +340,7 @@ async def _get_model_async(
         backend,
         model_path,
         server_url,
+        vl_system_prompt,
         **kwargs,
     )
 

@@ -9,7 +9,9 @@ import numpy as np
 import pypdfium2 as pdfium
 from loguru import logger
 from mineru_vl_utils import MinerUClient
-from mineru_vl_utils.structs import BlockType
+from mineru_vl_utils.structs import BLOCK_TYPES, BlockType, ExtractResult
+from mineru_vl_utils.vlm_client.base_client import DEFAULT_SYSTEM_PROMPT
+from mineru_vl_utils.vlm_client.utils import gather_tasks
 from tqdm import tqdm
 
 from mineru.backend.hybrid.hybrid_model_output_to_middle_json import (
@@ -31,6 +33,7 @@ from mineru.data.data_reader_writer import DataWriter
 from mineru.utils.boxbase import calculate_overlap_area_2_minbox_area_ratio
 from mineru.utils.config_reader import get_device, get_processing_window_size
 from mineru.utils.enum_class import ImageType, NotExtractType, BlockType as MineruBlockType
+from mineru.utils.engine_utils import get_vlm_engine
 from mineru.utils.model_utils import crop_img, get_vram, clean_memory
 from mineru.utils.ocr_utils import get_adjusted_mfdetrec_res, get_ocr_result_list, sorted_boxes, merge_det_boxes, \
     update_det_boxes, OcrConfidence
@@ -54,6 +57,211 @@ LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD = 0.8
 
 not_extract_list = [item.value for item in NotExtractType]
 HYBRID_OCR_DET_TEXT_TYPES = set(not_extract_list)
+
+BENCH_REMOTE_EXTRACT_TYPES = frozenset(
+    {BlockType.TABLE, BlockType.EQUATION, BlockType.IMAGE, BlockType.CHART}
+)
+
+
+def _bench_dual_predictor_enabled(backend: str, server_url: str | None) -> bool:
+    if backend != "http-client":
+        return False
+    if not (server_url and server_url.strip()):
+        return False
+    return os.getenv("MINERU_HYBRID_BENCH_DUAL_PREDICTOR", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _resolve_bench_layout_backend() -> str:
+    explicit = os.getenv("MINERU_HYBRID_BENCH_LAYOUT_BACKEND", "").strip()
+    if explicit:
+        return explicit
+    return get_vlm_engine("auto", is_async=False)
+
+
+def _bench_remote_not_extract_list() -> list[str]:
+    return [block_type for block_type in BLOCK_TYPES if block_type not in BENCH_REMOTE_EXTRACT_TYPES]
+
+
+def _apply_remote_extract_outputs(
+    layout_results: list[ExtractResult],
+    all_indices: list[tuple[int, int]],
+    outputs,
+) -> None:
+    for (img_idx, idx), output in zip(all_indices, outputs):
+        layout_results[img_idx][idx].content = output.text
+        layout_results[img_idx][idx].scored = output.scored
+
+
+def _summarize_remote_prompt_mix(prompts: list[str]) -> dict[str, int]:
+    mix = {"table": 0, "equation": 0, "image_analysis": 0, "other": 0}
+    for prompt in prompts:
+        if "Table Recognition" in prompt:
+            mix["table"] += 1
+        elif "Formula Recognition" in prompt:
+            mix["equation"] += 1
+        elif "Image Analysis" in prompt:
+            mix["image_analysis"] += 1
+        else:
+            mix["other"] += 1
+    return {name: count for name, count in mix.items() if count > 0}
+
+
+def _dual_predictor_batch_two_step_extract(
+    layout_predictor: MinerUClient,
+    extract_predictor: MinerUClient,
+    images: list,
+    *,
+    image_analysis: bool = True,
+) -> list[ExtractResult]:
+    remote_skip = _bench_remote_not_extract_list()
+    layout_results = layout_predictor.batch_layout_detect(images)
+    prepared_inputs = extract_predictor.helper.batch_prepare_for_extract(
+        extract_predictor.executor,
+        images,
+        layout_results,
+        remote_skip,
+        image_analysis,
+    )
+    all_images, all_prompts, all_params, all_indices = extract_predictor._flatten_prepared_inputs(
+        prepared_inputs
+    )
+    if all_images:
+        logger.info(
+            "Bench dual-predictor remote extracts: blocks={} mix={}",
+            len(all_images),
+            _summarize_remote_prompt_mix(all_prompts),
+        )
+        outputs = extract_predictor._batch_predict(all_images, all_prompts, all_params, None, None)
+        _apply_remote_extract_outputs(layout_results, all_indices, outputs)
+    processed_list = extract_predictor.helper.batch_post_process(
+        extract_predictor.executor,
+        layout_results,
+    )
+    results = [
+        ExtractResult(blocks, layout.layout_scored)
+        for layout, blocks in zip(layout_results, processed_list)
+    ]
+    if extract_predictor.helper.enable_cross_page_table_merge:
+        from mineru_vl_utils.post_process.cross_page_table import detect_cross_page_cell_merge
+
+        params = extract_predictor.sampling_params.get("[cross_page_table_merge]")
+
+        def batch_predict_fn(prompts: list[str]) -> list[str]:
+            return extract_predictor.client.batch_predict(
+                [None] * len(prompts),
+                prompts,
+                [params] * len(prompts),
+            )
+
+        detect_cross_page_cell_merge(results, batch_predict_fn)
+    return results
+
+
+async def _dual_predictor_aio_batch_two_step_extract(
+    layout_predictor: MinerUClient,
+    extract_predictor: MinerUClient,
+    images: list,
+    *,
+    semaphore: asyncio.Semaphore | None = None,
+    image_analysis: bool = True,
+) -> list[ExtractResult]:
+    remote_skip = _bench_remote_not_extract_list()
+    semaphore = semaphore or asyncio.Semaphore(extract_predictor.max_concurrency)
+    layout_results = await layout_predictor.aio_batch_layout_detect(images, semaphore=semaphore)
+    prepared_inputs = await gather_tasks(
+        tasks=[
+            extract_predictor.helper.aio_prepare_for_extract(
+                extract_predictor.executor,
+                image,
+                layout_result,
+                remote_skip,
+                image_analysis,
+            )
+            for image, layout_result in zip(images, layout_results)
+        ],
+        use_tqdm=extract_predictor.use_tqdm,
+        tqdm_desc="Extract Preparation",
+    )
+    all_images, all_prompts, all_params, all_indices = extract_predictor._flatten_prepared_inputs(
+        prepared_inputs
+    )
+    if all_images:
+        logger.info(
+            "Bench dual-predictor remote extracts: blocks={} mix={}",
+            len(all_images),
+            _summarize_remote_prompt_mix(all_prompts),
+        )
+        outputs = await extract_predictor._aio_batch_predict(
+            all_images,
+            all_prompts,
+            all_params,
+            None,
+            semaphore,
+            None,
+            use_tqdm=extract_predictor.use_tqdm,
+            tqdm_desc="Extraction",
+        )
+        _apply_remote_extract_outputs(layout_results, all_indices, outputs)
+    processed_list = await gather_tasks(
+        tasks=[
+            extract_predictor.helper.aio_post_process(extract_predictor.executor, layout_result)
+            for layout_result in layout_results
+        ],
+        use_tqdm=extract_predictor.use_tqdm,
+        tqdm_desc="Post Processing",
+    )
+    results = [
+        ExtractResult(blocks, layout.layout_scored)
+        for layout, blocks in zip(layout_results, processed_list)
+    ]
+    if extract_predictor.helper.enable_cross_page_table_merge:
+        from mineru_vl_utils.post_process.cross_page_table import aio_detect_cross_page_cell_merge
+
+        params = extract_predictor.sampling_params.get("[cross_page_table_merge]")
+
+        async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
+            return await extract_predictor.client.aio_batch_predict(
+                [None] * len(prompts),
+                prompts,
+                [params] * len(prompts),
+            )
+
+        await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
+    return results
+
+
+def _resolve_hybrid_predictors(
+    backend: str,
+    model_path: str | None,
+    server_url: str | None,
+    predictor: MinerUClient | None,
+    kwargs: dict,
+) -> tuple[MinerUClient, MinerUClient | None]:
+    if predictor is None:
+        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
+    if not _bench_dual_predictor_enabled(backend, server_url):
+        return predictor, None
+    layout_backend = _resolve_bench_layout_backend()
+    # Keep layout detection on MinerU's native/default prompt so extract-tuning
+    # prompt profiles do not perturb block detection behavior.
+    layout_predictor = ModelSingleton().get_model(
+        layout_backend,
+        model_path,
+        None,
+        vl_system_prompt=DEFAULT_SYSTEM_PROMPT,
+        **kwargs,
+    )
+    logger.info(
+        "Bench dual-predictor hybrid: layout backend={} extract backend={} server_url={}",
+        layout_backend,
+        backend,
+        server_url,
+    )
+    return layout_predictor, predictor
 
 
 def _is_hybrid_ocr_det_candidate(block):
@@ -726,9 +934,20 @@ def doc_analyze(
     client_side_output_generation = bool(
         kwargs.pop("client_side_output_generation", False)
     )
-    if predictor is None:
-        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
-    predictor = _maybe_enable_serial_execution(predictor, backend)
+    layout_predictor, extract_predictor = _resolve_hybrid_predictors(
+        backend,
+        model_path,
+        server_url,
+        predictor,
+        kwargs,
+    )
+    if extract_predictor is not None:
+        layout_backend = _resolve_bench_layout_backend()
+        layout_predictor = _maybe_enable_serial_execution(layout_predictor, layout_backend)
+        extract_predictor = _maybe_enable_serial_execution(extract_predictor, backend)
+    else:
+        layout_predictor = _maybe_enable_serial_execution(layout_predictor, backend)
+    predictor = layout_predictor
 
     device = get_device()
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
@@ -788,12 +1007,21 @@ def doc_analyze(
                             batch_ratio,
                         )
                     else:
-                        with predictor_execution_guard(predictor):
-                            window_model_list = predictor.batch_two_step_extract(
-                                images=images_pil_list,
-                                not_extract_list=not_extract_list,
-                                image_analysis=image_analysis,
-                            )
+                        if extract_predictor is not None:
+                            with predictor_execution_guard(layout_predictor):
+                                window_model_list = _dual_predictor_batch_two_step_extract(
+                                    layout_predictor,
+                                    extract_predictor,
+                                    images=images_pil_list,
+                                    image_analysis=image_analysis,
+                                )
+                        else:
+                            with predictor_execution_guard(predictor):
+                                window_model_list = predictor.batch_two_step_extract(
+                                    images=images_pil_list,
+                                    not_extract_list=not_extract_list,
+                                    image_analysis=image_analysis,
+                                )
                         window_model_list, hybrid_pipeline_model = _process_ocr_and_formulas(
                             images_pil_list,
                             window_model_list,
@@ -876,9 +1104,21 @@ async def aio_doc_analyze(
     client_side_output_generation = bool(
         kwargs.pop("client_side_output_generation", False)
     )
-    if predictor is None:
-        predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
-    predictor = _maybe_enable_serial_execution(predictor, backend)
+    layout_predictor, extract_predictor = await asyncio.to_thread(
+        _resolve_hybrid_predictors,
+        backend,
+        model_path,
+        server_url,
+        predictor,
+        kwargs,
+    )
+    if extract_predictor is not None:
+        layout_backend = _resolve_bench_layout_backend()
+        layout_predictor = _maybe_enable_serial_execution(layout_predictor, layout_backend)
+        extract_predictor = _maybe_enable_serial_execution(extract_predictor, backend)
+    else:
+        layout_predictor = _maybe_enable_serial_execution(layout_predictor, backend)
+    predictor = layout_predictor
 
     device = get_device()
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
@@ -938,12 +1178,21 @@ async def aio_doc_analyze(
                             batch_ratio,
                         )
                     else:
-                        async with aio_predictor_execution_guard(predictor):
-                            window_model_list = await predictor.aio_batch_two_step_extract(
-                                images=images_pil_list,
-                                not_extract_list=not_extract_list,
-                                image_analysis=image_analysis,
-                            )
+                        if extract_predictor is not None:
+                            async with aio_predictor_execution_guard(layout_predictor):
+                                window_model_list = await _dual_predictor_aio_batch_two_step_extract(
+                                    layout_predictor,
+                                    extract_predictor,
+                                    images=images_pil_list,
+                                    image_analysis=image_analysis,
+                                )
+                        else:
+                            async with aio_predictor_execution_guard(predictor):
+                                window_model_list = await predictor.aio_batch_two_step_extract(
+                                    images=images_pil_list,
+                                    not_extract_list=not_extract_list,
+                                    image_analysis=image_analysis,
+                                )
                         window_model_list, hybrid_pipeline_model = await asyncio.to_thread(
                             _process_ocr_and_formulas,
                             images_pil_list,
