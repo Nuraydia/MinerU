@@ -55,10 +55,13 @@ _QWEN_MINERU_COMPAT_SYSTEM_PROMPT = (
     "Image Analysis output contract: return only MinerU-tagged fields "
     "(<|class_start|>...<|class_end|>, <|sub_class_start|>...<|sub_class_end|>, "
     "<|caption_start|>...<|caption_end|>, <|content_start|>...<|content_end|>). "
-    "Isotope formatting rules: prefer canonical Unicode in plain text (¹⁷⁷Lu, ⁶⁸Ga-PSMA-11, ⁹⁹ᵐTc-MDP, ⁶⁸Ge/⁶⁸Ga); "
-    "when LaTeX is required, use compact form without spaced tokens "
-    "(^{177}\\mathrm{Lu}, ^{68}\\mathrm{Ga}, ^{99m}\\mathrm{Tc}) and avoid malformed spacing like "
-    "^ { 1 7 7 } \\mathsf { L u }."
+    "For diagrams, charts, and slide-like figures, transcribe visible labels and summarize "
+    "the flow or takeaway concisely inside <|content_start|>...<|content_end|>; do not attempt "
+    "open-ended full-page commentary. "
+    "Notation consistency: keep nuclear-medicine symbols in one stable, readable form across "
+    "body text and table cells; do not switch markup style for the same label in adjacent regions. "
+    "Prefer plain characters over math wrappers when the source shows a simple nuclide or tracer name. "
+    "If a formula truly requires math markup, keep it compact inside <eq>...</eq> without spaced tokens."
 )
 
 
@@ -72,20 +75,77 @@ def _resolve_vl_system_prompt() -> str:
     return DEFAULT_SYSTEM_PROMPT
 
 
+def _is_http_client_backend(backend: str) -> bool:
+    return backend == "http-client" or backend.endswith("-http-client")
+
+
+def _resolve_http_client_int_env(key: str, default: int) -> int:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid {}={!r}", key, raw)
+        return default
+    if value <= 0:
+        return default
+    return value
+
+
+def _resolve_http_client_float_env(key: str, default: float) -> float:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid {}={!r}", key, raw)
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+def _resolve_vl_max_new_tokens_for_key(param_key: str, default: int | None) -> int | None:
+    env_by_key = {
+        "image": "MINERU_VL_IMAGE_MAX_NEW_TOKENS",
+        "image_block": "MINERU_VL_IMAGE_MAX_NEW_TOKENS",
+        "chart": "MINERU_VL_IMAGE_MAX_NEW_TOKENS",
+        "table": "MINERU_VL_TABLE_MAX_NEW_TOKENS",
+        "equation": "MINERU_VL_EQUATION_MAX_NEW_TOKENS",
+    }
+    env_key = env_by_key.get(param_key)
+    if env_key:
+        raw = os.getenv(env_key, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid {}={!r}", env_key, raw)
+                return default
+            return value if value > 0 else default
+    return default
+
+
 def _apply_vl_max_new_tokens_from_env(predictor: MinerUClient, backend: str) -> None:
-    if not backend.endswith("-http-client"):
+    if not _is_http_client_backend(backend):
         return
     raw = os.getenv("MINERU_VL_MAX_NEW_TOKENS", "").strip()
-    if not raw:
-        return
-    try:
-        limit = int(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid MINERU_VL_MAX_NEW_TOKENS={!r}", raw)
-        return
-    if limit <= 0:
-        return
+    limit: int | None = None
+    if raw:
+        try:
+            parsed_limit = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid MINERU_VL_MAX_NEW_TOKENS={!r}", raw)
+        else:
+            if parsed_limit > 0:
+                limit = parsed_limit
     for name, params in list(predictor.sampling_params.items()):
+        param_key = name.strip("[]")
+        effective_limit = _resolve_vl_max_new_tokens_for_key(param_key, limit)
+        if effective_limit is None:
+            continue
         predictor.sampling_params[name] = MinerUSamplingParams(
             temperature=params.temperature,
             top_p=params.top_p,
@@ -94,11 +154,14 @@ def _apply_vl_max_new_tokens_from_env(predictor: MinerUClient, backend: str) -> 
             frequency_penalty=params.frequency_penalty,
             repetition_penalty=params.repetition_penalty,
             no_repeat_ngram_size=params.no_repeat_ngram_size,
-            max_new_tokens=limit,
+            max_new_tokens=effective_limit,
         )
     logger.info(
-        "http-client VLM max_new_tokens={} (MINERU_VL_MAX_NEW_TOKENS) for backend={}",
+        "http-client VLM max_new_tokens applied: global={} image/chart={} table={} equation={} backend={}",
         limit,
+        os.getenv("MINERU_VL_IMAGE_MAX_NEW_TOKENS", "").strip() or None,
+        os.getenv("MINERU_VL_TABLE_MAX_NEW_TOKENS", "").strip() or None,
+        os.getenv("MINERU_VL_EQUATION_MAX_NEW_TOKENS", "").strip() or None,
         backend,
     )
 
@@ -132,11 +195,31 @@ class ModelSingleton:
                 lmdeploy_engine = None
                 vllm_async_llm = None
                 batch_size = kwargs.get("batch_size", 0)  # for transformers backend only
-                max_concurrency = kwargs.get("max_concurrency", 100)  # for http-client backend only
-                http_timeout = kwargs.get("http_timeout", 600)  # for http-client backend only
+                max_concurrency = kwargs.get(
+                    "max_concurrency",
+                    _resolve_http_client_int_env("MINERU_VL_MAX_CONCURRENCY", 100),
+                )
+                http_timeout = kwargs.get(
+                    "http_timeout",
+                    _resolve_http_client_int_env("MINERU_VL_HTTP_TIMEOUT", 600),
+                )
+                max_retries = kwargs.get(
+                    "max_retries",
+                    _resolve_http_client_int_env("MINERU_VL_MAX_RETRIES", 1),
+                )
+                retry_backoff_factor = kwargs.get(
+                    "retry_backoff_factor",
+                    _resolve_http_client_float_env("MINERU_VL_RETRY_BACKOFF_FACTOR", 0.2),
+                )
+                if _is_http_client_backend(backend):
+                    logger.info(
+                        "http-client VLM limits: max_concurrency={} http_timeout={}s max_retries={} retry_backoff_factor={}",
+                        max_concurrency,
+                        http_timeout,
+                        max_retries,
+                        retry_backoff_factor,
+                    )
                 server_headers = kwargs.get("server_headers", None)  # for http-client backend only
-                max_retries = kwargs.get("max_retries", 3)  # for http-client backend only
-                retry_backoff_factor = kwargs.get("retry_backoff_factor", 0.5)  # for http-client backend only
                 # 从kwargs中移除这些参数，避免传递给不相关的初始化函数
                 for param in ["batch_size", "max_concurrency", "http_timeout", "server_headers", "max_retries", "retry_backoff_factor"]:
                     if param in kwargs:

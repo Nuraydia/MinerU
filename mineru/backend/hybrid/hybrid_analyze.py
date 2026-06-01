@@ -60,7 +60,7 @@ not_extract_list = [item.value for item in NotExtractType]
 HYBRID_OCR_DET_TEXT_TYPES = set(not_extract_list)
 
 BENCH_REMOTE_EXTRACT_TYPES = frozenset(
-    {BlockType.TABLE, BlockType.EQUATION, BlockType.IMAGE, BlockType.CHART}
+    {BlockType.TABLE, BlockType.EQUATION, BlockType.IMAGE, BlockType.CHART, "image_block"}
 )
 BENCH_REMOTE_TEXT_TYPES = frozenset(
     {
@@ -75,6 +75,7 @@ BENCH_REMOTE_TEXT_TYPES = frozenset(
         BlockType.LIST_ITEM,
     }
 )
+BENCH_REMOTE_TEXT_PRUNE_THRESHOLD = 0.85
 _BENCH_SUSPICIOUS_TEXT_RE = re.compile(
     r"(\\mathsf|\\mathrm|\\mathfrak|\\left|\\right|\^\s*\{|\$\s*\^)",
     re.IGNORECASE,
@@ -112,6 +113,173 @@ def _apply_remote_extract_outputs(
     for (img_idx, idx), output in zip(all_indices, outputs):
         layout_results[img_idx][idx].content = output.text
         layout_results[img_idx][idx].scored = output.scored
+
+
+def _bbox_area(bbox) -> float:
+    if not (isinstance(bbox, list) and len(bbox) == 4):
+        return 0.0
+    return max(0.0, float(bbox[2]) - float(bbox[0])) * max(
+        0.0,
+        float(bbox[3]) - float(bbox[1]),
+    )
+
+
+def _bbox_overlap_ratio_in_first_bbox(first_bbox, second_bbox) -> float:
+    first_area = _bbox_area(first_bbox)
+    if first_area <= 0:
+        return 0.0
+    x0 = max(float(first_bbox[0]), float(second_bbox[0]))
+    y0 = max(float(first_bbox[1]), float(second_bbox[1]))
+    x1 = min(float(first_bbox[2]), float(second_bbox[2]))
+    y1 = min(float(first_bbox[3]), float(second_bbox[3]))
+    overlap = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    return overlap / first_area
+
+
+def _is_nested_in_remote_visual_block(
+    text_block: dict,
+    visual_block: dict,
+    *,
+    threshold: float,
+) -> bool:
+    text_bbox = text_block.get("bbox")
+    visual_bbox = visual_block.get("bbox")
+    if not (
+        isinstance(text_bbox, list)
+        and len(text_bbox) == 4
+        and isinstance(visual_bbox, list)
+        and len(visual_bbox) == 4
+    ):
+        return False
+    if _bbox_area(visual_bbox) <= _bbox_area(text_bbox):
+        return False
+    return _bbox_overlap_ratio_in_first_bbox(text_bbox, visual_bbox) >= threshold
+
+
+def _prune_text_blocks_nested_in_remote_visuals(model_list: list[list[dict]]) -> int:
+    removed = 0
+    for page_blocks in model_list:
+        remote_visual_blocks = [
+            block
+            for block in page_blocks
+            if block.get("type") in BENCH_REMOTE_EXTRACT_TYPES
+        ]
+        if not remote_visual_blocks:
+            continue
+
+        kept_blocks = []
+        for block in page_blocks:
+            block_type = block.get("type")
+            if block_type not in BENCH_REMOTE_TEXT_TYPES:
+                kept_blocks.append(block)
+                continue
+            if any(
+                _is_nested_in_remote_visual_block(
+                    block,
+                    visual_block,
+                    threshold=BENCH_REMOTE_TEXT_PRUNE_THRESHOLD,
+                )
+                for visual_block in remote_visual_blocks
+            ):
+                removed += 1
+                continue
+            kept_blocks.append(block)
+        page_blocks[:] = kept_blocks
+    if removed:
+        logger.info("Bench dual-predictor pruned nested visual text blocks: {}", removed)
+    return removed
+
+
+def _bench_remote_fail_open_types() -> set[str]:
+    raw = os.getenv("MINERU_HYBRID_BENCH_REMOTE_FAIL_OPEN_TYPES", "image,chart").strip()
+    if not raw:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _is_bench_remote_fail_open_block(block_type: str) -> bool:
+    return block_type in _bench_remote_fail_open_types()
+
+
+def _format_bench_remote_extract_error(exc: BaseException) -> str:
+    message = str(exc).strip()
+    exc_type = type(exc).__name__
+    return f"{exc_type}: {message}" if message else f"{exc_type}: {repr(exc)}"
+
+
+def _describe_bench_remote_extract(
+    layout_results: list[ExtractResult],
+    remote_index: int,
+    remote_total: int,
+    img_idx: int,
+    block_idx: int,
+    image,
+) -> dict:
+    block = layout_results[img_idx][block_idx]
+    image_shape = getattr(image, "shape", None)
+    return {
+        "remote_index": remote_index,
+        "remote_total": remote_total,
+        "page_index": img_idx,
+        "block_index": block_idx,
+        "block_type": block.type,
+        "bbox": block.bbox,
+        "image_shape": tuple(image_shape) if image_shape is not None else None,
+    }
+
+
+async def _aio_batch_predict_bench_remote_resilient(
+    extract_predictor: MinerUClient,
+    layout_results: list[ExtractResult],
+    all_images,
+    all_prompts,
+    all_params,
+    all_indices,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    total = len(all_images)
+    for remote_index, (image, prompt, params, (img_idx, block_idx)) in enumerate(
+        zip(all_images, all_prompts, all_params, all_indices),
+        start=1,
+    ):
+        descriptor = _describe_bench_remote_extract(
+            layout_results,
+            remote_index,
+            total,
+            img_idx,
+            block_idx,
+            image,
+        )
+        logger.info("Bench remote extract start: {}", descriptor)
+        try:
+            predicted = await extract_predictor._aio_batch_predict(
+                [image],
+                [prompt],
+                [params],
+                None,
+                semaphore,
+                None,
+                use_tqdm=False,
+                tqdm_desc="Extraction",
+            )
+        except Exception as exc:
+            error_text = _format_bench_remote_extract_error(exc)
+            descriptor["error"] = error_text
+            if _is_bench_remote_fail_open_block(descriptor["block_type"]):
+                block = layout_results[img_idx][block_idx]
+                block.content = ""
+                block["bench_remote_error"] = error_text
+                block["bench_remote_failed_open"] = True
+                logger.warning("Bench remote extract failed open: {}", descriptor)
+                continue
+            logger.exception("Bench remote extract failed: {}", descriptor)
+            raise
+        _apply_remote_extract_outputs(
+            layout_results,
+            [(img_idx, block_idx)],
+            predicted,
+        )
+        logger.info("Bench remote extract complete: {}", descriptor)
 
 
 def _bench_remote_text_repair_enabled() -> bool:
@@ -348,17 +516,28 @@ async def _dual_predictor_aio_batch_two_step_extract(
             len(all_images),
             _summarize_remote_prompt_mix(all_prompts),
         )
-        outputs = await extract_predictor._aio_batch_predict(
-            all_images,
-            all_prompts,
-            all_params,
-            None,
-            semaphore,
-            None,
-            use_tqdm=extract_predictor.use_tqdm,
-            tqdm_desc="Extraction",
-        )
-        _apply_remote_extract_outputs(layout_results, all_indices, outputs)
+        if _bench_remote_fail_open_types():
+            await _aio_batch_predict_bench_remote_resilient(
+                extract_predictor,
+                layout_results,
+                all_images,
+                all_prompts,
+                all_params,
+                all_indices,
+                semaphore,
+            )
+        else:
+            outputs = await extract_predictor._aio_batch_predict(
+                all_images,
+                all_prompts,
+                all_params,
+                None,
+                semaphore,
+                None,
+                use_tqdm=extract_predictor.use_tqdm,
+                tqdm_desc="Extraction",
+            )
+            _apply_remote_extract_outputs(layout_results, all_indices, outputs)
     processed_list = await gather_tasks(
         tasks=[
             extract_predictor.helper.aio_post_process(extract_predictor.executor, layout_result)
@@ -1168,6 +1347,7 @@ def doc_analyze(
                                     images=images_pil_list,
                                     image_analysis=image_analysis,
                                 )
+                            _prune_text_blocks_nested_in_remote_visuals(window_model_list)
                         else:
                             with predictor_execution_guard(predictor):
                                 window_model_list = predictor.batch_two_step_extract(
@@ -1345,6 +1525,7 @@ async def aio_doc_analyze(
                                     images=images_pil_list,
                                     image_analysis=image_analysis,
                                 )
+                            _prune_text_blocks_nested_in_remote_visuals(window_model_list)
                         else:
                             async with aio_predictor_execution_guard(predictor):
                                 window_model_list = await predictor.aio_batch_two_step_extract(

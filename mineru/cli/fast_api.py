@@ -83,6 +83,7 @@ SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
 RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
+DEFAULT_TASK_TIMEOUT_SECONDS = 30 * 60
 DEFAULT_OUTPUT_ROOT = "./output"
 FILE_PARSE_TASK_ID_HEADER = "X-MinerU-Task-Id"
 FILE_PARSE_TASK_STATUS_HEADER = "X-MinerU-Task-Status"
@@ -302,6 +303,17 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def format_task_error(exc: BaseException) -> str:
+    message = str(exc).strip()
+    exc_type = type(exc).__name__
+    if message:
+        return f"{exc_type}: {message}"
+    representation = repr(exc).strip()
+    if representation and representation != f"{exc_type}()":
+        return f"{exc_type}: {representation}"
+    return f"{exc_type}: task failed without an exception message"
+
+
 def get_int_env(name: str, default: int, minimum: int = 0) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -329,6 +341,14 @@ def get_task_cleanup_interval_seconds() -> int:
         "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS",
         DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS,
         minimum=1,
+    )
+
+
+def get_task_timeout_seconds() -> int:
+    return get_int_env(
+        "MINERU_API_TASK_TIMEOUT_SECONDS",
+        DEFAULT_TASK_TIMEOUT_SECONDS,
+        minimum=0,
     )
 
 
@@ -932,8 +952,15 @@ class AsyncTaskManager:
         self.is_shutting_down = False
         self.task_retention_seconds = get_task_retention_seconds()
         self.task_cleanup_interval_seconds = get_task_cleanup_interval_seconds()
+        self.task_timeout_seconds = get_task_timeout_seconds()
         self.manager_wakeup = asyncio.Event()
         self._next_submit_order = 1
+        logger.info(
+            "Async task manager configured: task_timeout_seconds={} task_retention_seconds={} cleanup_interval_seconds={}",
+            self.task_timeout_seconds,
+            self.task_retention_seconds,
+            self.task_cleanup_interval_seconds,
+        )
 
     async def start(self) -> None:
         self.is_shutting_down = False
@@ -978,6 +1005,13 @@ class AsyncTaskManager:
         self.tasks[task.task_id] = task
         self.task_events[task.task_id] = asyncio.Event()
         await self.queue.put(task.task_id)
+        logger.info(
+            "Async task submitted: task_id={} backend={} files={} queued_ahead={}",
+            task.task_id,
+            task.backend,
+            task.file_names,
+            self.get_queued_ahead(task.task_id),
+        )
 
     def get(self, task_id: str) -> Optional[AsyncParseTask]:
         return self.tasks.get(task_id)
@@ -1144,7 +1178,7 @@ class AsyncTaskManager:
             raise
         except Exception as exc:
             task.status = TASK_FAILED
-            task.error = str(exc)
+            task.error = format_task_error(exc)
             task.completed_at = utc_now_iso()
             self._signal_task_event(task_id)
             logger.exception(f"Async task failed: {task_id}")
@@ -1153,6 +1187,12 @@ class AsyncTaskManager:
         task.status = TASK_PROCESSING
         task.started_at = utc_now_iso()
         task.error = None
+        logger.info(
+            "Async task started: task_id={} backend={} timeout_seconds={}",
+            task.task_id,
+            task.backend,
+            self.task_timeout_seconds,
+        )
 
         uploads = [
             StoredUpload(
@@ -1167,14 +1207,28 @@ class AsyncTaskManager:
             )
         ]
         config = getattr(self.app.state, "config", {})
-        await run_parse_job(
+        run_job_coro = run_parse_job(
             output_dir=task.output_dir,
             uploads=uploads,
             request_options=task,
             config=config,
         )
+        if self.task_timeout_seconds > 0:
+            try:
+                await asyncio.wait_for(run_job_coro, timeout=self.task_timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Task exceeded MINERU_API_TASK_TIMEOUT_SECONDS={self.task_timeout_seconds}"
+                ) from exc
+        else:
+            await run_job_coro
         task.status = TASK_COMPLETED
         task.completed_at = utc_now_iso()
+        logger.info(
+            "Async task completed: task_id={} backend={}",
+            task.task_id,
+            task.backend,
+        )
         self._signal_task_event(task.task_id)
 
     def cleanup_expired_tasks(self) -> int:
@@ -1383,6 +1437,8 @@ async def health_check():
         "processing_window_size": get_processing_window_size(
             default=DEFAULT_PROCESSING_WINDOW_SIZE
         ),
+        "last_worker_error": task_manager.last_worker_error,
+        "task_timeout_seconds": task_manager.task_timeout_seconds,
         "task_retention_seconds": task_manager.task_retention_seconds,
         "task_cleanup_interval_seconds": task_manager.task_cleanup_interval_seconds,
     }

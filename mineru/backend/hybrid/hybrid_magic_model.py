@@ -185,7 +185,7 @@ class MagicModel:
                 }
                 if span_type == ContentType.TABLE:
                     span["html"] = block_content
-                elif raw_block_type in ["image", "chart"] and block_content is not None:
+                elif raw_block_type in ["image", "chart", "image_block"] and block_content is not None:
                     span["content"] = block_content
             elif span_type == ContentType.INTERLINE_EQUATION:
                 span = {
