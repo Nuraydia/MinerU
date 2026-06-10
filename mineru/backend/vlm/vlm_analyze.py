@@ -107,6 +107,18 @@ def _resolve_http_client_float_env(key: str, default: float) -> float:
     return value
 
 
+def _resolve_http_client_server_headers(server_headers):
+    if server_headers is not None and not isinstance(server_headers, dict):
+        return server_headers
+
+    headers = dict(server_headers or {})
+    has_authorization = any(key.lower() == "authorization" for key in headers)
+    api_key = os.getenv("MINERU_VL_API_KEY", "").strip()
+    if api_key and not has_authorization:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers or None
+
+
 def _resolve_vl_max_new_tokens_for_key(param_key: str, default: int | None) -> int | None:
     env_by_key = {
         "image": "MINERU_VL_IMAGE_MAX_NEW_TOKENS",
@@ -219,7 +231,9 @@ class ModelSingleton:
                         max_retries,
                         retry_backoff_factor,
                     )
-                server_headers = kwargs.get("server_headers", None)  # for http-client backend only
+                server_headers = _resolve_http_client_server_headers(
+                    kwargs.get("server_headers", None)
+                )  # for http-client backend only
                 # 从kwargs中移除这些参数，避免传递给不相关的初始化函数
                 for param in ["batch_size", "max_concurrency", "http_timeout", "server_headers", "max_retries", "retry_backoff_factor"]:
                     if param in kwargs:

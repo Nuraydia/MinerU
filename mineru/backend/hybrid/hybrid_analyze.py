@@ -83,7 +83,7 @@ _BENCH_SUSPICIOUS_TEXT_RE = re.compile(
 
 
 def _bench_dual_predictor_enabled(backend: str, server_url: str | None) -> bool:
-    if backend != "http-client":
+    if backend != "http-client" and not backend.endswith("-http-client"):
         return False
     if not (server_url and server_url.strip()):
         return False
