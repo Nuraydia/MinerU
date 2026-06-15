@@ -13,6 +13,7 @@ from mineru_vl_utils import MinerUClient
 from mineru_vl_utils.structs import BLOCK_TYPES, BlockType, ExtractResult
 from mineru_vl_utils.vlm_client.base_client import DEFAULT_SYSTEM_PROMPT
 from mineru_vl_utils.vlm_client.utils import gather_tasks
+from PIL import Image
 from tqdm import tqdm
 
 from mineru.backend.hybrid.hybrid_model_output_to_middle_json import (
@@ -302,6 +303,20 @@ def _bench_remote_text_repair_max_blocks() -> int:
         )
         return 8
     return max(1, value)
+
+
+def _remote_ocr_recognition_enabled() -> bool:
+    raw = os.getenv("MINERU_HYBRID_REMOTE_OCR_RECOGNITION", "").strip().lower()
+    return raw in {"1", "true", "yes"}
+
+
+def _remote_ocr_text_prompt() -> str:
+    return os.getenv(
+        "MINERU_HYBRID_REMOTE_OCR_TEXT_PROMPT",
+        "\nRaw biomedical OCR only. No Markdown, LaTeX, XML, or explanations.\n"
+        "Use plain isotope/unit text, e.g. $^{177}$Lu t$_{1/2}$ -> 177Lu t1/2.\n"
+        "Text:",
+    )
 
 
 def _crop_normalized_bbox_from_page_image(page_image, bbox):
@@ -945,6 +960,7 @@ def _process_ocr_and_formulas(
     inline_formula_enable,
     _ocr_enable,
     batch_ratio: int = 1,
+    extract_predictor: MinerUClient | None = None,
 ):
     """处理OCR和公式识别"""
 
@@ -1012,8 +1028,34 @@ def _process_ocr_and_formulas(
                     need_ocr_list.append((page_ocr_res_list, ocr_res))
                     img_crop_list.append(ocr_res.pop('np_img'))
         if len(img_crop_list) > 0:
-            # Process OCR
-            ocr_result_list = hybrid_pipeline_model.ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+            if extract_predictor is not None and _remote_ocr_recognition_enabled():
+                remote_img_crop_list = [
+                    Image.fromarray(crop) if isinstance(crop, np.ndarray) else crop
+                    for crop in img_crop_list
+                ]
+                original_text_prompt = extract_predictor.prompts.get("text")
+                extract_predictor.prompts["text"] = _remote_ocr_text_prompt()
+                try:
+                    remote_outputs = extract_predictor.batch_content_extract(
+                        remote_img_crop_list,
+                        ["text"] * len(img_crop_list),
+                    )
+                finally:
+                    if original_text_prompt is None:
+                        extract_predictor.prompts.pop("text", None)
+                    else:
+                        extract_predictor.prompts["text"] = original_text_prompt
+                ocr_result_list = [
+                    (str(output).strip() if output is not None else "", 1.0)
+                    for output in remote_outputs
+                ]
+                logger.info(
+                    "Hybrid remote OCR recognition completed: crops={}",
+                    len(img_crop_list),
+                )
+            else:
+                # Process OCR
+                ocr_result_list = hybrid_pipeline_model.ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
 
             # Verify we have matching counts
             assert len(ocr_result_list) == len(need_ocr_list), f'ocr_result_list: {len(ocr_result_list)}, need_ocr_list: {len(need_ocr_list)}'
@@ -1273,6 +1315,13 @@ def doc_analyze(
         predictor,
         kwargs,
     )
+    remote_ocr_predictor = extract_predictor
+    if (
+        remote_ocr_predictor is None
+        and (backend == "http-client" or backend.endswith("-http-client"))
+        and server_url
+    ):
+        remote_ocr_predictor = layout_predictor
     if extract_predictor is not None:
         layout_backend = _resolve_bench_layout_backend()
         layout_predictor = _maybe_enable_serial_execution(layout_predictor, layout_backend)
@@ -1362,6 +1411,7 @@ def doc_analyze(
                             inline_formula_enable,
                             _ocr_enable,
                             batch_ratio=batch_ratio,
+                            extract_predictor=remote_ocr_predictor,
                         )
                         if extract_predictor is not None:
                             _repair_suspicious_text_blocks_with_remote(
@@ -1451,6 +1501,13 @@ async def aio_doc_analyze(
         predictor,
         kwargs,
     )
+    remote_ocr_predictor = extract_predictor
+    if (
+        remote_ocr_predictor is None
+        and (backend == "http-client" or backend.endswith("-http-client"))
+        and server_url
+    ):
+        remote_ocr_predictor = layout_predictor
     if extract_predictor is not None:
         layout_backend = _resolve_bench_layout_backend()
         layout_predictor = _maybe_enable_serial_execution(layout_predictor, layout_backend)
@@ -1541,6 +1598,7 @@ async def aio_doc_analyze(
                             inline_formula_enable,
                             _ocr_enable,
                             batch_ratio=batch_ratio,
+                            extract_predictor=remote_ocr_predictor,
                         )
                         if extract_predictor is not None:
                             await _aio_repair_suspicious_text_blocks_with_remote(
