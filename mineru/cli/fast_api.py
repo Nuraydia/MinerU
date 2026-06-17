@@ -3,6 +3,7 @@ import asyncio
 import mimetypes
 import multiprocessing
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -418,6 +419,34 @@ def get_image_mime_type(image_path: str) -> str:
     return "image/jpeg"
 
 
+_ISOTOPE_PREFIX_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*\$\s*[-\s]*([A-Z][a-z]?)")
+_ISOTOPE_COMPACT_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*([A-Z][a-z]?)\s*\$")
+_ISOTOPE_SUFFIX_LATEX_RE = re.compile(r"\b([A-Z][a-z]?)\s*\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*\$")
+_FOOTNOTE_SUPERSCRIPT_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*([A-Za-z])\s*\}\s*\$")
+_LATEX_MATHRM_RE = re.compile(r"\\mathrm\s*\{\s*([^{}]+?)\s*\}")
+_LATEX_TEXT_RE = re.compile(r"\\text\s*\{\s*([^{}]+?)\s*\}")
+
+
+def normalize_markdown_plain_text(markdown: str) -> str:
+    value = _ISOTOPE_COMPACT_LATEX_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}",
+        markdown,
+    )
+    value = _ISOTOPE_PREFIX_LATEX_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}",
+        value,
+    )
+    value = _ISOTOPE_SUFFIX_LATEX_RE.sub(
+        lambda match: f"{match.group(2)}{match.group(1)}",
+        value,
+    )
+    value = _FOOTNOTE_SUPERSCRIPT_LATEX_RE.sub(lambda match: match.group(1), value)
+    value = re.sub(r"\bSUV\s*\$_\{\s*max\s*\}\$", "SUVmax", value, flags=re.IGNORECASE)
+    value = _LATEX_MATHRM_RE.sub(lambda match: match.group(1), value)
+    value = _LATEX_TEXT_RE.sub(lambda match: match.group(1), value)
+    return value
+
+
 def get_infer_result(
     file_suffix_identifier: str, pdf_name: str, parse_dir: str
 ) -> Optional[str]:
@@ -425,7 +454,10 @@ def get_infer_result(
     result_file_path = os.path.join(parse_dir, f"{pdf_name}{file_suffix_identifier}")
     if os.path.exists(result_file_path):
         with open(result_file_path, "r", encoding="utf-8") as fp:
-            return fp.read()
+            content = fp.read()
+        if file_suffix_identifier == ".md":
+            return normalize_markdown_plain_text(content)
+        return content
     return None
 
 
@@ -536,13 +568,15 @@ def create_result_zip(
             if return_md:
                 path = os.path.join(parse_dir, f"{pdf_name}.md")
                 if os.path.exists(path):
-                    zf.write(
-                        path,
+                    with open(path, "r", encoding="utf-8") as fp:
+                        md_content = normalize_markdown_plain_text(fp.read())
+                    zf.writestr(
                         arcname=build_zip_arcname(
                             pdf_name,
                             parse_dir,
                             f"{pdf_name}.md",
                         ),
+                        data=md_content,
                     )
 
             if return_middle_json:
