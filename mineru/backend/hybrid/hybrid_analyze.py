@@ -663,6 +663,64 @@ async def _dual_predictor_aio_batch_two_step_extract(
     return results
 
 
+async def _aio_remote_extract_existing_blocks(
+    extract_predictor: MinerUClient,
+    layout_results: list[ExtractResult],
+    images: list,
+    *,
+    semaphore: asyncio.Semaphore | None = None,
+    image_analysis: bool = True,
+) -> None:
+    remote_skip = _bench_remote_not_extract_list()
+    semaphore = semaphore or asyncio.Semaphore(extract_predictor.max_concurrency)
+    prepared_inputs = await gather_tasks(
+        tasks=[
+            extract_predictor.helper.aio_prepare_for_extract(
+                extract_predictor.executor,
+                image,
+                layout_result,
+                remote_skip,
+                image_analysis,
+            )
+            for image, layout_result in zip(images, layout_results)
+        ],
+        use_tqdm=extract_predictor.use_tqdm,
+        tqdm_desc="Remote Visual Preparation",
+    )
+    all_images, all_prompts, all_params, all_indices = extract_predictor._flatten_prepared_inputs(
+        prepared_inputs
+    )
+    if not all_images:
+        return
+    logger.info(
+        "Bench dual-predictor remote visual overlay: blocks={} mix={}",
+        len(all_images),
+        _summarize_remote_prompt_mix(all_prompts),
+    )
+    if _bench_remote_fail_open_types():
+        await _aio_batch_predict_bench_remote_resilient(
+            extract_predictor,
+            layout_results,
+            all_images,
+            all_prompts,
+            all_params,
+            all_indices,
+            semaphore,
+        )
+    else:
+        outputs = await extract_predictor._aio_batch_predict(
+            all_images,
+            all_prompts,
+            all_params,
+            None,
+            semaphore,
+            None,
+            use_tqdm=extract_predictor.use_tqdm,
+            tqdm_desc="Remote Visual Extraction",
+        )
+        _apply_remote_extract_outputs(layout_results, all_indices, outputs)
+
+
 def _resolve_hybrid_predictors(
     backend: str,
     model_path: str | None,
@@ -1646,6 +1704,13 @@ async def aio_doc_analyze(
                         async with aio_predictor_execution_guard(predictor):
                             window_model_list = await predictor.aio_batch_two_step_extract(
                                 images=images_pil_list,
+                                image_analysis=image_analysis,
+                            )
+                        if extract_predictor is not None:
+                            await _aio_remote_extract_existing_blocks(
+                                extract_predictor,
+                                window_model_list,
+                                images_pil_list,
                                 image_analysis=image_analysis,
                             )
                         hybrid_pipeline_model = await asyncio.to_thread(
