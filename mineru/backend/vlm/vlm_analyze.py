@@ -64,9 +64,10 @@ _QWEN_MINERU_COMPAT_SYSTEM_PROMPT = (
     "(<|class_start|>...<|class_end|>, <|sub_class_start|>...<|sub_class_end|>, "
     "<|caption_start|>...<|caption_end|>, <|content_start|>...<|content_end|>). "
     "Inside caption and content fields, use plain visible text and plain isotope notation. "
-    "For diagrams, charts, and slide-like figures, transcribe visible labels and summarize "
-    "the flow or takeaway concisely inside <|content_start|>...<|content_end|>; do not attempt "
-    "open-ended full-page commentary. "
+    "For diagrams, charts, and slide-like figures, include the visible labels, legends, axes, "
+    "group names, numeric annotations, flow steps, and main trend or comparison inside "
+    "<|content_start|>...<|content_end|>. Be detailed enough for downstream review, but do "
+    "not invent values or commentary that are not supported by visible content. "
     "Notation consistency: keep nuclear-medicine symbols in one stable, readable form across "
     "body text and table cells; do not switch markup style for the same label in adjacent regions. "
     "Prefer plain characters over math wrappers when the source shows a simple nuclide or tracer name. "
@@ -90,19 +91,25 @@ _NURAYDIA_QWEN_MINERU_COMPAT_PROMPTS = {
         "\nImage Analysis: Return only MinerU image fields "
         "<|class_start|>...<|class_end|><|sub_class_start|>...<|sub_class_end|>"
         "<|caption_start|>...<|caption_end|><|content_start|>...<|content_end|>. "
-        "Inside caption/content, use plain visible text and plain isotope notation."
+        "Inside caption/content, use plain visible text and plain isotope notation. "
+        "Include visible labels, legends, group names, numeric annotations, and the main "
+        "visual comparison or process when present."
     ),
     "image_block": (
         "\nImage Analysis: Return only MinerU image fields "
         "<|class_start|>...<|class_end|><|sub_class_start|>...<|sub_class_end|>"
         "<|caption_start|>...<|caption_end|><|content_start|>...<|content_end|>. "
-        "Inside caption/content, use plain visible text and plain isotope notation."
+        "Inside caption/content, use plain visible text and plain isotope notation. "
+        "Include visible labels, legends, group names, numeric annotations, and the main "
+        "visual comparison or process when present."
     ),
     "chart": (
         "\nImage Analysis: Return only MinerU image fields "
         "<|class_start|>chart<|class_end|><|sub_class_start|>...<|sub_class_end|>"
         "<|caption_start|>...<|caption_end|><|content_start|>...<|content_end|>. "
-        "Transcribe visible chart labels and summarize the takeaway concisely using plain text."
+        "Transcribe chart titles, axes, legends, group labels, visible numeric annotations, "
+        "and the main trend or comparison using plain text. Do not fabricate a full data "
+        "table from approximate plotted points unless the values are explicitly printed."
     ),
     "[default]": (
         "\nText Recognition: Return only the plain visible text in reading order. "
