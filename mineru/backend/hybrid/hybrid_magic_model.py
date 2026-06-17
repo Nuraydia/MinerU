@@ -112,6 +112,7 @@ class MagicModel:
                 block_type = block_info["type"]
                 raw_block_type = block_type
                 block_content = block_info.get("content")
+                use_remote_ocr_text = bool(block_info.get("_remote_ocr_text"))
                 block_angle = block_info.get("angle", 0)
                 block_sub_type = (
                     block_info.get("sub_type")
@@ -193,7 +194,7 @@ class MagicModel:
                     "type": span_type,
                     "content": isolated_formula_clean(block_content),
                 }
-            elif _vlm_ocr_enable or block_type not in not_extract_list:
+            elif use_remote_ocr_text or _vlm_ocr_enable or block_type not in not_extract_list:
                 # vlm_ocr_enable 模式下，所有文本块都直接使用 block 的内容
                 # 非 vlm_ocr_enable 模式下，非提取块仍沿用直接内容模式
                 if block_content:
@@ -263,7 +264,7 @@ class MagicModel:
                     ContentType.CHART,
                     ContentType.INTERLINE_EQUATION,
                 ]
-                or (_vlm_ocr_enable or block_type not in not_extract_list)
+                or (use_remote_ocr_text or _vlm_ocr_enable or block_type not in not_extract_list)
             ):
                 if span is None:
                     continue

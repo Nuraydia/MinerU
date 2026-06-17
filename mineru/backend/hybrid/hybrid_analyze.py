@@ -60,7 +60,7 @@ LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD = 0.8
 not_extract_list = [item.value for item in NotExtractType]
 HYBRID_OCR_DET_TEXT_TYPES = set(not_extract_list)
 
-BENCH_REMOTE_EXTRACT_TYPES = frozenset(
+BENCH_REMOTE_VISUAL_EXTRACT_TYPES = frozenset(
     {BlockType.TABLE, BlockType.EQUATION, BlockType.IMAGE, BlockType.CHART, "image_block"}
 )
 BENCH_REMOTE_TEXT_TYPES = frozenset(
@@ -103,7 +103,22 @@ def _resolve_bench_layout_backend() -> str:
 
 
 def _bench_remote_not_extract_list() -> list[str]:
-    return [block_type for block_type in BLOCK_TYPES if block_type not in BENCH_REMOTE_EXTRACT_TYPES]
+    return [
+        block_type
+        for block_type in BLOCK_TYPES
+        if block_type not in _bench_remote_extract_types()
+    ]
+
+
+def _bench_remote_extract_types() -> frozenset[str]:
+    if _remote_text_block_extraction_enabled():
+        return BENCH_REMOTE_VISUAL_EXTRACT_TYPES | BENCH_REMOTE_TEXT_TYPES
+    return BENCH_REMOTE_VISUAL_EXTRACT_TYPES
+
+
+def _remote_text_block_extraction_enabled() -> bool:
+    raw = os.getenv("MINERU_HYBRID_REMOTE_TEXT_BLOCK_EXTRACTION", "").strip().lower()
+    return raw in {"1", "true", "yes"}
 
 
 def _apply_remote_extract_outputs(
@@ -163,7 +178,7 @@ def _prune_text_blocks_nested_in_remote_visuals(model_list: list[list[dict]]) ->
         remote_visual_blocks = [
             block
             for block in page_blocks
-            if block.get("type") in BENCH_REMOTE_EXTRACT_TYPES
+            if block.get("type") in _bench_remote_extract_types()
         ]
         if not remote_visual_blocks:
             continue
@@ -286,22 +301,22 @@ async def _aio_batch_predict_bench_remote_resilient(
 def _bench_remote_text_repair_enabled() -> bool:
     raw = os.getenv("MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR", "").strip().lower()
     if raw == "":
-        return True
+        return _remote_ocr_recognition_enabled()
     return raw in {"1", "true", "yes"}
 
 
 def _bench_remote_text_repair_max_blocks() -> int:
     raw = os.getenv("MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR_MAX_BLOCKS", "").strip()
     if not raw:
-        return 8
+        return 128
     try:
         value = int(raw)
     except ValueError:
         logger.warning(
-            "Invalid MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR_MAX_BLOCKS={!r}, using default 8",
+            "Invalid MINERU_HYBRID_BENCH_REMOTE_TEXT_REPAIR_MAX_BLOCKS={!r}, using default 128",
             raw,
         )
-        return 8
+        return 128
     return max(1, value)
 
 
@@ -313,10 +328,57 @@ def _remote_ocr_recognition_enabled() -> bool:
 def _remote_ocr_text_prompt() -> str:
     return os.getenv(
         "MINERU_HYBRID_REMOTE_OCR_TEXT_PROMPT",
-        "\nRaw biomedical OCR only. No Markdown, LaTeX, XML, or explanations.\n"
-        "Use plain isotope/unit text, e.g. $^{177}$Lu t$_{1/2}$ -> 177Lu t1/2.\n"
+        "\nRaw biomedical OCR only.\n"
+        "Return only the text visible inside this crop.\n"
+        "Do not add Markdown, XML tags, MinerU tags, LaTeX, explanations, or reference markup.\n"
+        "Do not output <ref_start|>, <|ref_start|>, <eq>, $, \\text{}, superscript markup, or code fences.\n"
+        "Write isotope notation as plain text, for example 177Lu, 225Ac, 18F.\n"
+        "Preserve biomedical abbreviations, values, parentheses, brackets, percentages, HR/P values, and punctuation.\n"
+        "If the crop contains only part of a paragraph, transcribe only the visible crop text.\n"
         "Text:",
     )
+
+
+_BENCH_PROTOCOL_TAG_RE = re.compile(r"<\|?ref_(?:start|end)\|?>|<eq>.*?</eq>", re.IGNORECASE)
+_BENCH_EMPTY_BRACKET_RE = re.compile(
+    r"(?:[（(]\\s*[，,;；:：\\-—–]*\\s*[）)]|[［\\[]\\s*[\\-—–]*\\s*[］\\]])"
+)
+_BENCH_NUMERIC_PLACEHOLDER_RE = re.compile(
+    r"(?:达|由|至|为|于|时间|HR|P|≥|≤)\\s*(?:万|个?月|%|，|,|。|[）)])|[—-]\\s*年"
+)
+
+
+def _remote_text_repair_mode() -> str:
+    raw = os.getenv("MINERU_HYBRID_REMOTE_TEXT_REPAIR_MODE", "").strip().lower()
+    if raw in {"off", "none", "false", "0"}:
+        return "off"
+    if raw in {"suspicious", "all"}:
+        return raw
+    return "all" if _remote_ocr_recognition_enabled() else "suspicious"
+
+
+def _is_remote_text_repair_candidate(content: str) -> bool:
+    return bool(
+        _BENCH_SUSPICIOUS_TEXT_RE.search(content)
+        or _BENCH_PROTOCOL_TAG_RE.search(content)
+        or _BENCH_EMPTY_BRACKET_RE.search(content)
+        or _BENCH_NUMERIC_PLACEHOLDER_RE.search(content)
+    )
+
+
+def _normalize_remote_ocr_text(text: str) -> str:
+    value = str(text).strip()
+    value = re.sub(r"<\|?ref_start\|?>\s*[^<]*\s*<\|?ref_end\|?>", "", value)
+    value = re.sub(r"<eq>(.*?)</eq>", r"\1", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"```(?:\\w+)?|```", "", value)
+    value = value.replace("\\\\$", "$")
+    value = re.sub(r"\$\s*\^\{(\d+)\}\s*\$", r"\1", value)
+    value = re.sub(r"\$\s*\^\{(\d+)\}\s*\\text\{([A-Za-z]+)\}\s*\$", r"\1\2", value)
+    value = re.sub(r"\^\{(\d+)\}\s*\\text\{([A-Za-z]+)\}", r"\1\2", value)
+    value = re.sub(r"\\text\{([^{}]*)\}", r"\1", value)
+    value = value.replace("$", "")
+    value = re.sub(r"<[^>]+>", "", value)
+    return value.strip()
 
 
 def _crop_normalized_bbox_from_page_image(page_image, bbox):
@@ -342,6 +404,9 @@ def _build_suspicious_text_repair_candidates(
     max_blocks: int,
 ) -> list[tuple[dict, object, str]]:
     candidates: list[tuple[dict, object, str]] = []
+    repair_mode = _remote_text_repair_mode()
+    if repair_mode == "off":
+        return candidates
     for page_image, page_blocks in zip(images, page_model_list):
         for block in page_blocks:
             block_type = block.get("type")
@@ -349,9 +414,8 @@ def _build_suspicious_text_repair_candidates(
                 continue
             text_field = "text" if block_type == "ocr_text" else "content"
             content = block.get(text_field)
-            if not isinstance(content, str) or not content.strip():
-                continue
-            if not _BENCH_SUSPICIOUS_TEXT_RE.search(content):
+            content_value = content if isinstance(content, str) else ""
+            if repair_mode != "all" and not _is_remote_text_repair_candidate(content_value):
                 continue
             crop = _crop_normalized_bbox_from_page_image(page_image, block.get("bbox"))
             if crop is None:
@@ -376,18 +440,27 @@ def _repair_suspicious_text_blocks_with_remote(
     )
     if not candidates:
         return
-    outputs = extract_predictor.batch_content_extract(
-        [crop for _, crop, _ in candidates],
-        ["text"] * len(candidates),
-    )
+    original_text_prompt = extract_predictor.prompts.get("text")
+    extract_predictor.prompts["text"] = _remote_ocr_text_prompt()
+    try:
+        outputs = extract_predictor.batch_content_extract(
+            [crop for _, crop, _ in candidates],
+            ["text"] * len(candidates),
+        )
+    finally:
+        if original_text_prompt is None:
+            extract_predictor.prompts.pop("text", None)
+        else:
+            extract_predictor.prompts["text"] = original_text_prompt
     replaced = 0
     for (block, _, text_field), output in zip(candidates, outputs):
         if output is None:
             continue
-        text = str(output).strip()
+        text = _normalize_remote_ocr_text(str(output))
         if not text:
             continue
         block[text_field] = text
+        block["_remote_ocr_text"] = True
         replaced += 1
     logger.info(
         "Bench dual-predictor remote text repairs: candidates={} replaced={}",
@@ -411,19 +484,28 @@ async def _aio_repair_suspicious_text_blocks_with_remote(
     )
     if not candidates:
         return
-    outputs = await extract_predictor.aio_batch_content_extract(
-        [crop for _, crop, _ in candidates],
-        ["text"] * len(candidates),
-        semaphore=semaphore,
-    )
+    original_text_prompt = extract_predictor.prompts.get("text")
+    extract_predictor.prompts["text"] = _remote_ocr_text_prompt()
+    try:
+        outputs = await extract_predictor.aio_batch_content_extract(
+            [crop for _, crop, _ in candidates],
+            ["text"] * len(candidates),
+            semaphore=semaphore,
+        )
+    finally:
+        if original_text_prompt is None:
+            extract_predictor.prompts.pop("text", None)
+        else:
+            extract_predictor.prompts["text"] = original_text_prompt
     replaced = 0
     for (block, _, text_field), output in zip(candidates, outputs):
         if output is None:
             continue
-        text = str(output).strip()
+        text = _normalize_remote_ocr_text(str(output))
         if not text:
             continue
         block[text_field] = text
+        block["_remote_ocr_text"] = True
         replaced += 1
     logger.info(
         "Bench dual-predictor remote text repairs: candidates={} replaced={}",

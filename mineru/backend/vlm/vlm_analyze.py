@@ -37,6 +37,7 @@ from ...utils.pdfium_guard import (
 from ...utils.models_download_utils import auto_download_and_get_model_root_path
 
 from mineru_vl_utils import MinerUClient, MinerUSamplingParams
+from mineru_vl_utils.mineru_client import DEFAULT_PROMPTS
 from mineru_vl_utils.vlm_client.base_client import DEFAULT_SYSTEM_PROMPT
 from packaging import version
 
@@ -45,16 +46,24 @@ _QWEN_MINERU_COMPAT_SYSTEM_PROMPT = (
     "You are MinerU's vision extraction engine. "
     "Always follow the task suffix exactly and return only the requested payload. "
     "Do not output explanations, commentary, markdown fences, or JSON unless explicitly required by the task. "
+    "For all ordinary prose, titles, headings, numbering, citations, references, captions, labels, "
+    "biomedical abbreviations, units, HR/P values, percentages, and dates, use plain visible text only. "
+    "Never wrap ordinary prose or section numbers in <eq>, LaTeX, markdown, HTML, or MinerU protocol tags. "
+    "Write isotope notation as plain ASCII prefix text, for example 177Lu, 18F, 225Ac, and 68Ga. "
+    "Do not use superscript Unicode or LaTeX wrappers for isotope names. "
     "Layout Detection output contract: return only MinerU layout tokens "
     "(<|box_start|>...<|box_end|><|ref_start|>type<|ref_end|>...), never JSON arrays. "
     "Table Recognition output contract: return exactly one complete HTML table fragment "
     "(<table>...</table>) with rows and cells preserved; no prose; no markdown table pipes; no code fences. "
-    "If table cell content contains formulas, keep formulas inside <eq>...</eq> tags. "
+    "Inside table cells, keep ordinary biomedical text and isotope names plain. "
+    "Use <eq>...</eq> in table cells only for true mathematical formulas, never for isotope names, citations, "
+    "section numbers, HR/P values, units, percentages, or dates. "
     "Formula Recognition output contract: return only the formula content in clean LaTeX-compatible form; "
-    "no natural-language explanation and no surrounding ``` fences. "
+    "no natural-language explanation and no surrounding ``` fences. Formula Recognition is only for true formulas. "
     "Image Analysis output contract: return only MinerU-tagged fields "
     "(<|class_start|>...<|class_end|>, <|sub_class_start|>...<|sub_class_end|>, "
     "<|caption_start|>...<|caption_end|>, <|content_start|>...<|content_end|>). "
+    "Inside caption and content fields, use plain visible text and plain isotope notation. "
     "For diagrams, charts, and slide-like figures, transcribe visible labels and summarize "
     "the flow or takeaway concisely inside <|content_start|>...<|content_end|>; do not attempt "
     "open-ended full-page commentary. "
@@ -63,6 +72,45 @@ _QWEN_MINERU_COMPAT_SYSTEM_PROMPT = (
     "Prefer plain characters over math wrappers when the source shows a simple nuclide or tracer name. "
     "If a formula truly requires math markup, keep it compact inside <eq>...</eq> without spaced tokens."
 )
+
+_NURAYDIA_QWEN_MINERU_COMPAT_PROMPTS = {
+    **DEFAULT_PROMPTS,
+    "table": (
+        "\nTable Recognition: Return exactly one complete HTML <table>...</table> fragment. "
+        "Preserve rows and cells. Do not add prose, markdown table pipes, or code fences. "
+        "Use plain text inside cells for isotope names, citations, units, percentages, HR/P values, "
+        "and dates. Use <eq>...</eq> only for true mathematical formulas."
+    ),
+    "equation": (
+        "\nFormula Recognition: Return only the formula content in clean LaTeX-compatible form. "
+        "Do not include explanations, markdown fences, HTML, or MinerU tags. "
+        "Only use this formula style for true standalone formulas."
+    ),
+    "image": (
+        "\nImage Analysis: Return only MinerU image fields "
+        "<|class_start|>...<|class_end|><|sub_class_start|>...<|sub_class_end|>"
+        "<|caption_start|>...<|caption_end|><|content_start|>...<|content_end|>. "
+        "Inside caption/content, use plain visible text and plain isotope notation."
+    ),
+    "image_block": (
+        "\nImage Analysis: Return only MinerU image fields "
+        "<|class_start|>...<|class_end|><|sub_class_start|>...<|sub_class_end|>"
+        "<|caption_start|>...<|caption_end|><|content_start|>...<|content_end|>. "
+        "Inside caption/content, use plain visible text and plain isotope notation."
+    ),
+    "chart": (
+        "\nImage Analysis: Return only MinerU image fields "
+        "<|class_start|>chart<|class_end|><|sub_class_start|>...<|sub_class_end|>"
+        "<|caption_start|>...<|caption_end|><|content_start|>...<|content_end|>. "
+        "Transcribe visible chart labels and summarize the takeaway concisely using plain text."
+    ),
+    "[default]": (
+        "\nText Recognition: Return only the plain visible text in reading order. "
+        "Do not output markdown, HTML/XML tags, MinerU tags, LaTeX, <eq>, or explanations. "
+        "Preserve visible punctuation, numbers, citations, abbreviations, HR/P values, and units. "
+        "Write isotope notation as plain text, for example 177Lu, 18F, 225Ac, and 68Ga."
+    ),
+}
 
 
 def _resolve_vl_system_prompt() -> str:
@@ -73,6 +121,13 @@ def _resolve_vl_system_prompt() -> str:
     if profile in {"qwen-mineru-compat", "mineru-qwen-compat"}:
         return _QWEN_MINERU_COMPAT_SYSTEM_PROMPT
     return DEFAULT_SYSTEM_PROMPT
+
+
+def _resolve_vl_prompts() -> dict[str, str]:
+    profile = os.getenv("MINERU_VL_PROMPT_PROFILE", "").strip().lower()
+    if profile in {"qwen-mineru-compat", "mineru-qwen-compat"}:
+        return dict(_NURAYDIA_QWEN_MINERU_COMPAT_PROMPTS)
+    return dict(DEFAULT_PROMPTS)
 
 
 def _is_http_client_backend(backend: str) -> bool:
@@ -395,6 +450,7 @@ class ModelSingleton:
                     max_retries=max_retries,
                     retry_backoff_factor=retry_backoff_factor,
                     system_prompt=vl_system_prompt or _resolve_vl_system_prompt(),
+                    prompts=_resolve_vl_prompts(),
                     enable_table_formula_eq_wrap=True,
                     image_analysis=True,
                     enable_cross_page_table_merge=True,
