@@ -82,7 +82,9 @@ _BENCH_SUSPICIOUS_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _ISOTOPE_PREFIX_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*\$\s*[-\s]*([A-Z][a-z]?)")
+_ISOTOPE_COMPACT_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*([A-Z][a-z]?)\s*\$")
 _ISOTOPE_SUFFIX_LATEX_RE = re.compile(r"\b([A-Z][a-z]?)\s*\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*\$")
+_FOOTNOTE_SUPERSCRIPT_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*([A-Za-z])\s*\}\s*\$")
 _LATEX_MATHRM_RE = re.compile(r"\\mathrm\s*\{\s*([^{}]+?)\s*\}")
 _LATEX_TEXT_RE = re.compile(r"\\text\s*\{\s*([^{}]+?)\s*\}")
 
@@ -386,14 +388,19 @@ def _normalize_remote_ocr_text(text: str) -> str:
 
 
 def _normalize_biomedical_plain_text(text: str) -> str:
-    value = _ISOTOPE_PREFIX_LATEX_RE.sub(
+    value = _ISOTOPE_COMPACT_LATEX_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}",
         text,
+    )
+    value = _ISOTOPE_PREFIX_LATEX_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}",
+        value,
     )
     value = _ISOTOPE_SUFFIX_LATEX_RE.sub(
         lambda match: f"{match.group(2)}{match.group(1)}",
         value,
     )
+    value = _FOOTNOTE_SUPERSCRIPT_LATEX_RE.sub(lambda match: match.group(1), value)
     value = re.sub(r"\bSUV\s*\$_\{\s*max\s*\}\$", "SUVmax", value, flags=re.IGNORECASE)
     value = _LATEX_MATHRM_RE.sub(lambda match: match.group(1), value)
     value = _LATEX_TEXT_RE.sub(lambda match: match.group(1), value)
@@ -404,12 +411,17 @@ def _normalize_model_list_plain_text(model_list: list[list[dict]]) -> int:
     normalized = 0
     for page_model_list in model_list:
         for block in page_model_list:
-            content = getattr(block, "content", None)
+            content = getattr(block, "content", None) or (
+                block.get("content") if isinstance(block, dict) else None
+            )
             if not isinstance(content, str) or not content:
                 continue
             next_content = _normalize_biomedical_plain_text(content)
             if next_content != content:
-                block.content = next_content
+                if hasattr(block, "content"):
+                    block.content = next_content
+                if isinstance(block, dict):
+                    block["content"] = next_content
                 normalized += 1
     return normalized
 
