@@ -300,7 +300,8 @@ class ModelSingleton:
                 for param in ["batch_size", "max_concurrency", "http_timeout", "server_headers", "max_retries", "retry_backoff_factor"]:
                     if param in kwargs:
                         del kwargs[param]
-                if backend not in ["http-client"] and not model_path:
+                client_backend = "http-client" if _is_http_client_backend(backend) else backend
+                if client_backend != "http-client" and not model_path:
                     model_path = auto_download_and_get_model_root_path("/","vlm")
                 if backend == "transformers":
                     try:
@@ -443,7 +444,7 @@ class ModelSingleton:
                             backend_config=backend_config,
                         )
                 predictor = MinerUClient(
-                    backend=backend,
+                    backend=client_backend,
                     model=model,
                     processor=processor,
                     lmdeploy_engine=lmdeploy_engine,
