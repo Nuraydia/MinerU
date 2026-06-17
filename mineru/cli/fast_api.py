@@ -571,12 +571,12 @@ def create_result_zip(
                     with open(path, "r", encoding="utf-8") as fp:
                         md_content = normalize_markdown_plain_text(fp.read())
                     zf.writestr(
-                        arcname=build_zip_arcname(
+                        build_zip_arcname(
                             pdf_name,
                             parse_dir,
                             f"{pdf_name}.md",
                         ),
-                        data=md_content,
+                        md_content,
                     )
 
             if return_middle_json:
