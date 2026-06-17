@@ -81,6 +81,10 @@ _BENCH_SUSPICIOUS_TEXT_RE = re.compile(
     r"(\\mathsf|\\mathrm|\\mathfrak|\\left|\\right|\^\s*\{|\$\s*\^)",
     re.IGNORECASE,
 )
+_ISOTOPE_PREFIX_LATEX_RE = re.compile(r"\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*\$\s*[-\s]*([A-Z][a-z]?)")
+_ISOTOPE_SUFFIX_LATEX_RE = re.compile(r"\b([A-Z][a-z]?)\s*\$\s*\^\s*\{\s*(\d{1,3})\s*\}\s*\$")
+_LATEX_MATHRM_RE = re.compile(r"\\mathrm\s*\{\s*([^{}]+?)\s*\}")
+_LATEX_TEXT_RE = re.compile(r"\\text\s*\{\s*([^{}]+?)\s*\}")
 
 
 def _bench_dual_predictor_enabled(backend: str, server_url: str | None) -> bool:
@@ -379,6 +383,35 @@ def _normalize_remote_ocr_text(text: str) -> str:
     value = value.replace("$", "")
     value = re.sub(r"<[^>]+>", "", value)
     return value.strip()
+
+
+def _normalize_biomedical_plain_text(text: str) -> str:
+    value = _ISOTOPE_PREFIX_LATEX_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}",
+        text,
+    )
+    value = _ISOTOPE_SUFFIX_LATEX_RE.sub(
+        lambda match: f"{match.group(2)}{match.group(1)}",
+        value,
+    )
+    value = re.sub(r"\bSUV\s*\$_\{\s*max\s*\}\$", "SUVmax", value, flags=re.IGNORECASE)
+    value = _LATEX_MATHRM_RE.sub(lambda match: match.group(1), value)
+    value = _LATEX_TEXT_RE.sub(lambda match: match.group(1), value)
+    return value
+
+
+def _normalize_model_list_plain_text(model_list: list[list[dict]]) -> int:
+    normalized = 0
+    for page_model_list in model_list:
+        for block in page_model_list:
+            content = getattr(block, "content", None)
+            if not isinstance(content, str) or not content:
+                continue
+            next_content = _normalize_biomedical_plain_text(content)
+            if next_content != content:
+                block.content = next_content
+                normalized += 1
+    return normalized
 
 
 def _crop_normalized_bbox_from_page_image(page_image, bbox):
@@ -1560,6 +1593,9 @@ def doc_analyze(
                                 window_model_list,
                             )
 
+                    normalized_count = _normalize_model_list_plain_text(window_model_list)
+                    if normalized_count:
+                        logger.info("Normalized biomedical plain text blocks: {}", normalized_count)
                     model_list.extend(window_model_list)
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
@@ -1755,6 +1791,9 @@ async def aio_doc_analyze(
                                 semaphore=None,
                             )
 
+                    normalized_count = _normalize_model_list_plain_text(window_model_list)
+                    if normalized_count:
+                        logger.info("Normalized biomedical plain text blocks: {}", normalized_count)
                     model_list.extend(window_model_list)
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
