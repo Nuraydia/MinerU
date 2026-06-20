@@ -12,7 +12,7 @@ from loguru import logger
 from mineru_vl_utils import MinerUClient
 from mineru_vl_utils.structs import BLOCK_TYPES, BlockType, ExtractResult
 from mineru_vl_utils.vlm_client.base_client import DEFAULT_SYSTEM_PROMPT
-from mineru_vl_utils.vlm_client.utils import gather_tasks
+from mineru_vl_utils.vlm_client.utils import gather_tasks, get_png_bytes, get_rgb_image
 from PIL import Image
 from tqdm import tqdm
 
@@ -735,6 +735,19 @@ async def _aio_remote_extract_existing_blocks(
     all_images, all_prompts, all_params, all_indices = extract_predictor._flatten_prepared_inputs(
         prepared_inputs
     )
+    all_images = list(all_images)
+    all_prompts = list(all_prompts)
+    all_params = list(all_params)
+    all_indices = list(all_indices)
+    _supplement_missing_remote_image_blocks(
+        extract_predictor,
+        layout_results,
+        images,
+        all_images,
+        all_prompts,
+        all_params,
+        all_indices,
+    )
     if not all_images:
         return
     logger.info(
@@ -764,6 +777,72 @@ async def _aio_remote_extract_existing_blocks(
             tqdm_desc="Remote Visual Extraction",
         )
         _apply_remote_extract_outputs(layout_results, all_indices, outputs)
+
+
+def _supplement_missing_remote_image_blocks(
+    extract_predictor: MinerUClient,
+    layout_results: list[ExtractResult],
+    images: list,
+    all_images: list,
+    all_prompts: list,
+    all_params: list,
+    all_indices: list[tuple[int, int]],
+) -> None:
+    """Ensure standalone image_block visuals receive the overlay pass.
+
+    The upstream helper can omit image_block containers after the first extraction
+    pass in dense poster layouts, leaving meaningful chart/composite regions with
+    only weak OCR text or empty final content. The overlay pass is intentionally
+    the quality correction pass, so include eligible image_block containers even
+    when the helper did not select them.
+    """
+    selected = set(all_indices)
+    added = 0
+    for image_index, (image, blocks) in enumerate(zip(images, layout_results)):
+        rgb_image = get_rgb_image(image)
+        image_width, image_height = rgb_image.size
+        for block_index, block in enumerate(blocks):
+            if (image_index, block_index) in selected:
+                continue
+            if block.get("type") != "image_block":
+                continue
+            if not extract_predictor.helper._is_eligible_for_image_analysis(block):
+                continue
+            x1, y1, x2, y2 = block.bbox
+            scaled_bbox = (
+                x1 * image_width,
+                y1 * image_height,
+                x2 * image_width,
+                y2 * image_height,
+            )
+            block_image = rgb_image.crop(scaled_bbox)
+            if block_image.width < 1 or block_image.height < 1:
+                logger.warning(
+                    "Skipped supplemental remote image_block with invalid crop: page={} block={} size={}",
+                    image_index,
+                    block_index,
+                    block_image.size,
+                )
+                continue
+            if block.angle in [90, 180, 270]:
+                block_image = block_image.rotate(block.angle, expand=True)
+            block_image = extract_predictor.helper.resize_by_need(block_image)
+            if extract_predictor.backend == "http-client":
+                block_image = get_png_bytes(block_image)
+            all_images.append(block_image)
+            all_prompts.append(
+                extract_predictor.helper.prompts.get(block.type)
+                or extract_predictor.helper.prompts["[default]"]
+            )
+            all_params.append(
+                extract_predictor.helper.sampling_params.get(block.type)
+                or extract_predictor.helper.sampling_params.get("[default]")
+            )
+            all_indices.append((image_index, block_index))
+            selected.add((image_index, block_index))
+            added += 1
+    if added:
+        logger.info("Bench dual-predictor supplemental image_block overlay: added={}", added)
 
 
 def _resolve_hybrid_predictors(
